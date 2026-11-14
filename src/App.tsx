@@ -15,6 +15,7 @@ import { PostsPage, PostDetail } from "./pages/Posts";
 import { TopicsPage, TopicPage, TagsPage, TagPage } from "./pages/Discover";
 import { FollowingPage, UserPage } from "./pages/User";
 import LoginModal from "./components/LoginModal";
+import { AutoUpdateCheck } from "./components/UpdatePrompt";
 import { ToastHost } from "./components/ui";
 import { DesktopRail, DesktopTitleBar } from "./components/DesktopChrome";
 import ResizeHandles from "./components/ResizeHandles";
@@ -302,6 +303,8 @@ export default function App() {
       {isMobile ? <MobileShell /> : <DesktopShell />}
       <LoginModal />
       <ToastHost />
+      {/* 启动自动检查更新（仿 Kumone）：打开就查 fork 的 Release，有新版弹更新窗 */}
+      <AutoUpdateCheck />
       {/* 登录遮罩键盘处理占位 */}
       {loginOpen && <div className="hidden" onClick={() => setLoginOpen(false)} />}
     </>
