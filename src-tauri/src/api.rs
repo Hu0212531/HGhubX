@@ -217,7 +217,9 @@ pub async fn line_try_main() -> Result<Value, String> {
 
 /* ───────────────────────── 更新检查 ───────────────────────── */
 
-const REPO: &str = "zxsos/HGhubX";
+/* 更新检查查的是用户自己的 fork（Hu0212531/HGhubX），不是上游 zxsos/HGhubX。
+   用户的定制版（常亮修复等）只发在自己 fork 的 Release 里，查上游永远看不到新版。 */
+const REPO: &str = "Hu0212531/HGhubX";
 
 fn ver_parts(v: &str) -> Vec<u64> {
     v.trim()
@@ -352,7 +354,11 @@ pub async fn check_update() -> Result<Value, String> {
 /// 会先撞上 armv7 那个，64 位机器就降到 32 位跑了。所以按架构给分，取最高。
 fn asset_rank(name: &str) -> u8 {
     let n = name.to_ascii_lowercase();
-    if cfg!(target_os = "android") {
+    if cfg!(target_os = "ios") {
+        // iOS 安装包是 .ipa；之前没给 iOS 分支，asset 永远是 None，
+        // 前端拿不到直链，只能打开 Release 页再手动点。
+        if n.ends_with(".ipa") { 3 } else { 0 }
+    } else if cfg!(target_os = "android") {
         if !n.ends_with(".apk") {
             0
         } else if cfg!(target_arch = "aarch64") {
