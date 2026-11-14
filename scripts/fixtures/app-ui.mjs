@@ -42,6 +42,8 @@ export function installFixture({ theme, titles }) {
       if (command === "api_logout") return { ok: true };
       if (command === "security_set") return args.strict;
       if (command === "api_play") throw "UI fixture has no media";
+      // App 启动 1.5 秒后自动检查更新（仿 Kumone）；测试里返回“已是最新”，不弹更新窗。
+      if (command === "check_update") return { current: "2.0.2", latest: "2.0.2", has_update: false, url: "https://github.com/Hu0212531/HGhubX/releases" };
       if (command === "plugin:app|register_listener" && args.event === "back-button") { backChannel = args.handler; return; }
       if (command === "plugin:window|is_maximized" || command === "plugin:window|is_fullscreen") return false;
       return null;
