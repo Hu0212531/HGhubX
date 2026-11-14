@@ -37,6 +37,8 @@ try {
         if (["api_feed", "api_category", "api_posts", "api_original_videos", "api_post_category", "api_search_hot"].includes(cmd)) return Promise.resolve(emptyPage);
         // App's development-only playback self-test must not fetch media upstream.
         if (cmd === "api_play") return Promise.reject("Layout fixture has no playback media");
+        // App 启动 1.5 秒后自动检查更新（仿 Kumone）；测试里返回“已是最新”，不弹更新窗。
+        if (cmd === "check_update") return Promise.resolve({ current: "2.0.2", latest: "2.0.2", has_update: false, url: "https://github.com/Hu0212531/HGhubX/releases" });
         fixture.unexpected.push(cmd);
         return Promise.reject(`Unexpected IPC: ${cmd}`);
       } },
