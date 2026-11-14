@@ -3,6 +3,8 @@ import { useEffect, useState, type ReactNode } from "react";
 import { api, APP_VERSION, hostOf, logLine, platform, type UpdateInfo } from "../api";
 import { useStore } from "../store";
 import { Modal, Toggle } from "../components/ui";
+import { UpdateModal } from "../components/UpdatePrompt";
+import { checkForUpdate } from "../updateCheck";
 import LinePicker from "../components/LinePicker";
 import ProxySettings from "../components/ProxySettings";
 import { autoLineEnabled, setAutoLine } from "../autoLine";
@@ -30,8 +32,6 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
   const [clearing, setClearing] = useState(false);
   const [checking, setChecking] = useState(false);
   const [update, setUpdate] = useState<UpdateInfo | null>(null);
-  /** 应用内更新进行到哪一步（空串=没在更新） */
-  const [updating, setUpdating] = useState("");
   const playbackLog = usePlaybackLog();
   const [copyingLog, setCopyingLog] = useState(false);
   const [diagnosing, setDiagnosing] = useState(false);
@@ -52,34 +52,18 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
     };
   }, []);
 
+  /* 手动检查更新：忽略「稍后」记录，用户点进来就是想看有没有新版。
+     更新弹窗与启动自动检查共用同一份 UpdateModal。 */
   const checkUpdate = async () => {
     setChecking(true);
     try {
-      const info = await api.checkUpdate();
-      if (info.has_update) setUpdate(info);
-      else toast(`已是最新版本 v${info.current}`, "ok");
+      const info = await checkForUpdate(true);
+      if (info) setUpdate(info);
+      else toast(`已是最新版本 v${APP_VERSION}`, "ok");
     } catch (e) {
       toast((e as Error).message || "检查更新失败", "info");
     } finally {
       setChecking(false);
-    }
-  };
-  /** 更新：用系统浏览器打开下载页，由系统/浏览器完成下载与安装。
-   *
-   * 不再自己下载 APK 并调安装器 —— 那条路在安卓上要额外过 FileProvider
-   * 与「安装未知应用」授权，失败点多，体验并不比浏览器好。
-   */
-  const doUpdate = async () => {
-    if (!update) return;
-    setUpdating("打开中…");
-    try {
-      await api.openUrl(update.url);
-    } catch (e) {
-      await copyText(update.url)
-        .then(() => toast("下载地址已复制，可在浏览器粘贴打开", "ok"))
-        .catch(() => toast((e as Error).message || "打开失败", "info"));
-    } finally {
-      setUpdating("");
     }
   };
 
@@ -366,27 +350,7 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
         </div>
       </Modal>
 
-      <Modal open={!!update?.has_update} onClose={() => setUpdate(null)} width={392}>
-        <div className="p-5">
-          <div className="text-[16px] font-bold text-on">发现新版本</div>
-          <p className="text-[12px] text-mut mt-1.5">
-            v{update?.current} → <b className="text-on">v{update?.latest}</b>
-            {update?.published_at ? ` · ${update.published_at.slice(0, 10)}` : ""}
-          </p>
-          {!!update?.notes && (
-            <Surface className="mt-3 max-h-[180px] scroll-y rounded-(--r-sm) bg-s2 p-3 text-[12px] text-mut whitespace-pre-wrap leading-relaxed">{update.notes}</Surface>
-          )}
-          <div className="flex gap-2 mt-4">
-            <Button onClick={() => setUpdate(null)} disabled={!!updating}
-              className="flex-1 h-9 rounded-(--r-ctl) bg-s3 text-[14px] text-on/80 pressable disabled:opacity-60">稍后</Button>
-            <Button onClick={() => void doUpdate()} disabled={!!updating}
-              className="flex-1 h-9 rounded-(--r-ctl) bg-primary text-[14px] font-semibold text-on-primary pressable disabled:opacity-60">
-              {updating || "前往下载"}
-            </Button>
-          </div>
-          <div className="text-[12px] text-dim mt-2.5 break-all">{update?.url}</div>
-        </div>
-      </Modal>
+      <UpdateModal info={update} onClose={() => setUpdate(null)} />
     </div>
   );
 }
