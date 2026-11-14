@@ -1,5 +1,6 @@
 import { useCallback, useLayoutEffect, useRef, type RefObject } from "react";
 import type Hls from "hls.js";
+import { useWakeLock } from "./useWakeLock";
 
 /** Keep asynchronous autoplay and error recovery subject to the latest page activity. */
 export function usePlaybackActivity(
@@ -10,6 +11,8 @@ export function usePlaybackActivity(
   const wanted = useRef(autoPlay);
   const mounted = useRef(true);
   const previous = useRef(active);
+  // 播放时保持屏幕常亮：iOS 内嵌 <video> 不会阻止系统息屏，播一会儿就黑屏。
+  useWakeLock(videoRef);
   useLayoutEffect(() => { wanted.current = autoPlay; }, [src, autoPlay]);
 
   const play = useCallback((source: string, automatic = false) => {
