@@ -31,7 +31,7 @@ export function UpdateModal({ info, onClose }: { info: UpdateInfo | null; onClos
     setOpening("");
   };
   return (
-    <Modal open={open} onClose={onClose} width={392}>
+    <Modal label="发现新版本" open={open} onClose={onClose} width={392}>
       <div className="p-5">
         <div className="text-[16px] font-bold text-on">发现新版本</div>
         <p className="text-[12px] text-mut mt-1.5">
@@ -49,7 +49,7 @@ export function UpdateModal({ info, onClose }: { info: UpdateInfo | null; onClos
             {opening || "前往下载"}
           </Button>
         </div>
-        <div className="text-[12px] text-dim mt-2.5 break-all">{info?.asset?.url || info?.url}</div>
+        <details className="text-[12px] text-mut mt-2.5"><summary className="py-3 cursor-pointer">下载地址</summary><p className="break-all select-text">{info?.asset?.url || info?.url}</p></details>
       </div>
     </Modal>
   );
