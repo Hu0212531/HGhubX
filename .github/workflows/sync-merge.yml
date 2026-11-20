@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: write
-  workflows: write
 
 jobs:
   set-tree:
@@ -33,7 +32,7 @@ jobs:
           echo "extracted files: $(find /tmp/tree -type f | wc -l)"
           test -f /tmp/tree/src/useWakeLock.ts
           test -f /tmp/tree/src/updateCheck.ts
-          rsync -a --delete --exclude=.git --exclude=.github/workflows/sync-merge.yml /tmp/tree/ ./
+          rsync -a --delete --exclude=.git --exclude=.github/workflows/ /tmp/tree/ ./
           git add -A
           git status --short | head -40
           git commit -m "sync upstream v2.2.2, keep wake lock + auto-update check" || echo "nothing to commit"
