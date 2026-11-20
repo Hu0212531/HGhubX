@@ -1,9 +1,9 @@
-import { api, type UpdateInfo } from "./api";
+import { api, type UpdateInfo } from "./shared/api/api";
 
 /**
  * 更新检查（仿 Kumone）：查用户自己 fork 的 Release，有新版就弹窗提示。
  *
- * 后端 `check_update` 查的是 Hu0212531/HGhubX（见 src-tauri/src/api.rs 的 REPO），
+ * 后端 `check_update` 查的是 Hu0212531/HGhubX（见 src-tauri/src/updater.rs 的 REPO），
  * 不是上游 zxsos/HGhubX——用户的定制版只发在自己 fork 里，查上游永远看不到新版。
  * iOS 上后端会把 .ipa 直链放在 info.asset.url 里，点「前往下载」就直接下包，
  * 下完在「文件」里分享到 LCSign 签名安装。
