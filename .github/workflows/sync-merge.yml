@@ -1,39 +1,36 @@
-name: sync upstream merge (one-off)
+name: sync-merge
 on:
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/sync-merge.yml
   workflow_dispatch:
-
 permissions:
   contents: write
-
 jobs:
-  set-tree:
-    runs-on: ubuntu-24.04
+  merge:
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout main
+        uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
-      - name: Set main tree from 2.2.2 tarball
+      - name: Fetch sync branch chunks
         run: |
-          set -e
-          git config user.name "Rocky HGhubX sync"
-          git config user.email "rocky@local"
-          git fetch origin sync-tree
-          rm -f /tmp/tree.tar.gz.b64 /tmp/tree.tar.gz
+          git fetch origin sync-tree-225
           mkdir -p /tmp/tree
-          for i in 00 01 02 03 04 05 06 07 08 09 10 11; do
-            git show origin/sync-tree:tree-chunks/chunk-$i >> /tmp/tree.tar.gz.b64
-          done
-          base64 -d /tmp/tree.tar.gz.b64 > /tmp/tree.tar.gz
-          tar -xzf /tmp/tree.tar.gz -C /tmp/tree
-          echo "extracted files: $(find /tmp/tree -type f | wc -l)"
-          test -f /tmp/tree/src/useWakeLock.ts
-          test -f /tmp/tree/src/updateCheck.ts
-          rsync -a --delete --exclude=.git --exclude=.github/workflows/ /tmp/tree/ ./
+          git archive origin/sync-tree-225 tree-chunks | tar -x -C /tmp/tree
+      - name: Reassemble and extract merged tree
+        run: |
+          cd /tmp/tree/tree-chunks
+          cat chunk-* | base64 -d > /tmp/merged.tar.gz
+          mkdir -p /tmp/merged
+          tar xzf /tmp/merged.tar.gz -C /tmp/merged
+      - name: Rsync merged tree onto main (exclude workflows)
+        run: |
+          rsync -a --delete --exclude=.git --exclude=.github/workflows/ /tmp/merged/hghubx-merge/ ./
+          git status --short | head -30
+      - name: Commit and push
+        run: |
+          git config user.name "Hu0212531"
+          git config user.email "c760ann@gmail.com"
           git add -A
-          git status --short | head -40
-          git commit -m "sync upstream v2.2.2, keep wake lock + auto-update check" || echo "nothing to commit"
+          git commit -m "sync upstream v2.2.5, keep wake lock + auto-update check" || echo "nothing to commit"
           git push origin main
