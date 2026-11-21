@@ -5,6 +5,7 @@ import { isStrictSecurity, setStrictSecurity as setHtmlStrictSecurity } from "..
 import type { User } from "../api/types";
 import { readStorage, STORAGE_KEYS } from "../storage/storage";
 import { pickGuestData, useAccountData, type GuestData } from "./accountData";
+import { tr } from "../i18n";
 
 export type Platform = "android" | "ios" | "windows" | "macos" | "linux";
 export type Theme = "dark" | "light";
@@ -77,13 +78,17 @@ type Persist = GuestData & {
   preferHevc: boolean;
   /** 移动全屏控件无操作自动隐藏秒数：0=不自动隐藏（#146-3） */
   fsIdleSecs: number;
+  /** 启动时打开的页面：默认首页；选非首页可避免开机自动播放污染观看历史（#180-1） */
+  startupTab: Tab;
+  /** Ambient light around the player, sampled from the current frame. */
+  ambientGlow: boolean;
 };
 
 const LS = STORAGE_KEYS.app;
 const DEFAULTS: Persist = {
   likes: [], favs: [], history: [], follows: [],
   muted: true, muteOnStartup: true, volume: 0.7, searchHist: [], swipeEp: true, preferHevc: false,
-  fsIdleSecs: 3,
+  fsIdleSecs: 3, startupTab: "home", ambientGlow: true,
 };
 
 /** 旧版本 history 是 number[]，读出来时升级成带进度的结构 */
@@ -124,7 +129,9 @@ function loadPersist(): Persist {
       }
     } catch { /* ignore */ }
     const fsIdleSecs = [0, 3, 5, 10].includes(p.fsIdleSecs) ? p.fsIdleSecs : DEFAULTS.fsIdleSecs;
-    return { ...p, swipeEp, muteOnStartup, muted: muteOnStartup || p.muted === true, fsIdleSecs, history: normalizeHistory(p.history) };
+    const startupTab: Tab = (["home", "search", "category", "profile"] as Tab[]).includes(p.startupTab) ? p.startupTab : "home";
+    const ambientGlow = p.ambientGlow !== false;
+    return { ...p, swipeEp, muteOnStartup, muted: muteOnStartup || p.muted === true, fsIdleSecs, startupTab, ambientGlow, history: normalizeHistory(p.history) };
   } catch {
     return DEFAULTS;
   }
@@ -173,6 +180,7 @@ type Store = {
   stack: Page[]; push: (p: PageInput) => void; openRootPage: (p: PageInput) => void; pop: () => void;
   user: User | null; setUser: (u: User | null, origin?: string) => void;
   accountScope: string; accountSync: { busy: boolean; error: string; lastSynced: number; favoritesKnown: boolean };
+  accountGeneration: () => number;
   syncAccount: (options?: { manual?: boolean }) => Promise<void>;
   setCollected: (kind: "video" | "post", id: number, on: boolean, knownEpisodes?: number) => Promise<void>;
   setLiked: (kind: "video" | "post", id: number, ep: number, on: boolean) => Promise<void>;
@@ -190,6 +198,7 @@ type Store = {
   /** 记一条观看记录；`ep/t/dur` 省略时保留原进度，`ep` 变了就把进度归零 */
   addHistory: (id: number, ep?: number, t?: number, dur?: number) => void;
   clearHistory: () => Promise<void>;
+  removeHistory: (ids: number[]) => Promise<void>;
   toggleFollowLocal: (uid: number) => boolean;
   theater: boolean; setTheater: (v: boolean | ((p: boolean) => boolean)) => void;
   fs: boolean; setFs: (v: boolean | ((p: boolean) => boolean)) => void;
@@ -202,8 +211,10 @@ type Store = {
   swipeEp: boolean; setSwipeEp: (on: boolean) => void;
   preferHevc: boolean; setPreferHevc: (on: boolean) => void;
   fsIdleSecs: number; setFsIdleSecs: (s: number) => void;
+  startupTab: Tab; setStartupTab: (t: Tab) => void;
+  ambientGlow: boolean; setAmbientGlow: (on: boolean) => void;
   volume: number; setVolume: (v: number) => void;
-  searchHist: string[]; addSearch: (q: string) => void; clearSearchHist: () => void;
+  searchHist: string[]; addSearch: (q: string) => void; removeSearch: (q: string) => void; clearSearchHist: () => void;
   strictSecurity: boolean; strictSecurityReady: boolean; securityPending: boolean; cliRelaxed: boolean; setStrictSecurity: (on: boolean) => Promise<void>;
   toasts: Toast[]; toast: (msg: string, icon?: Toast["icon"], tag?: string) => void;
   /** 线路切换计数：变了就让列表页重挂载，重新拉一遍数据 */
@@ -255,7 +266,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [themePreference, setThemePreferenceState] = useState<ThemePreference>(readThemePreference);
   const [theme, setThemeState] = useState<Theme>(() => resolveTheme(readThemePreference()));
   const themeRef = useRef(theme);
-  const [tab, setTabRaw] = useState<Tab>("home");
+  const [tab, setTabRaw] = useState<Tab>(p.startupTab);
   const tabRef = useRef(tab);
   tabRef.current = tab;
   const [stack, setStack] = useState<Page[]>([]);
@@ -341,7 +352,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const setStrictSecurity = useCallback(async (on: boolean) => {
-    if (!strictSecurityReady) throw new Error("安全设置尚未读取，请重新启动应用");
+    if (!strictSecurityReady) throw new Error(tr("安全设置尚未读取，请重新启动应用"));
     setSecurityPending(true);
     try {
       const saved = await api.securitySet(on);
@@ -377,7 +388,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const now = Date.now();
       if (now - last < 60_000) return;
       last = now;
-      pushToastItem({ msg: "线路全部不可用，请检查网络或代理", icon: "info" }, 3600);
+      pushToastItem({ msg: tr("线路全部不可用，请检查网络或代理"), icon: "info" }, 3600);
     };
     window.addEventListener("hg:line-down", onDown);
     return () => window.removeEventListener("hg:line-down", onDown);
@@ -446,11 +457,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (!t) return;
     setP((s) => ({ ...s, searchHist: [t, ...s.searchHist.filter((x) => x !== t)].slice(0, 12) }));
   }, []);
+  const removeSearch = useCallback((q: string) => {
+    const t = q.trim();
+    if (!t) return;
+    setP((s) => ({ ...s, searchHist: s.searchHist.filter((x) => x !== t) }));
+  }, []);
   const clearSearchHist = useCallback(() => setP((s) => ({ ...s, searchHist: [] })), []);
 
   const logout = useCallback(async () => {
     await accountRef.current.logout();
-    toast("已退出登录", "info");
+    toast(tr("已退出登录"), "info");
   }, [toast]);
 
   const setTheater = useCallback((v: boolean | ((prev: boolean) => boolean)) => {
@@ -492,6 +508,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const setFsIdleSecs = useCallback((secs: number) => {
     setP((s) => ({ ...s, fsIdleSecs: [0, 3, 5, 10].includes(secs) ? secs : 3 }));
   }, []);
+  const setStartupTab = useCallback((t: Tab) => {
+    setP((s) => ({ ...s, startupTab: (["home", "search", "category", "profile"] as Tab[]).includes(t) ? t : "home" }));
+  }, []);
+  const setAmbientGlow = useCallback((on: boolean) => {
+    setP((s) => ({ ...s, ambientGlow: on }));
+  }, []);
   const setVolume = useCallback((v: number) => {
     const volume = Math.max(0, Math.min(1, v));
     if (volume > 0) lastVolumeRef.current = volume;
@@ -504,23 +526,26 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     tab, setTab, stack, push, openRootPage, pop,
     user, setUser, loginOpen, setLoginOpen, logout,
     accountScope: account.accountScope, accountSync: account.accountSync, syncAccount: account.syncAccount,
+    accountGeneration: account.generation,
     likes: account.likes, favs: account.favs, postLikes: account.postLikes, postFavs: account.postFavs, history: account.history, follows: account.follows,
     favEpCounts: account.favEpCounts, seedFavoriteEpisodes: account.seedFavoriteEpisodes, ackFavoriteEpisodes: account.ackFavoriteEpisodes,
     isLiked: account.isLiked, isFav: account.isFav,
     setCollected: account.setCollected, setLiked: account.setLiked, setFollowing: account.setFollowing, actionPending: account.actionPending,
     toggleLikeLocal: account.toggleLikeLocal, toggleFavLocal: account.toggleFavLocal, toggleFollowLocal: account.toggleFollowLocal,
-    addHistory: account.addHistory, clearHistory: account.clearHistory,
+    addHistory: account.addHistory, clearHistory: account.clearHistory, removeHistory: account.removeHistory,
     muted: p.muted, setMuted, volume: p.volume, setVolume, theater, setTheater, fs, setFs, clean, setClean, locked, setLocked,
     muteOnStartup: p.muteOnStartup, setMuteOnStartup,
     swipeEp: p.swipeEp, setSwipeEp,
     preferHevc: p.preferHevc, setPreferHevc,
     fsIdleSecs: p.fsIdleSecs, setFsIdleSecs,
-    searchHist: p.searchHist, addSearch, clearSearchHist,
+    startupTab: p.startupTab, setStartupTab,
+    ambientGlow: p.ambientGlow, setAmbientGlow,
+    searchHist: p.searchHist, addSearch, removeSearch, clearSearchHist,
     strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity,
     get toasts() { return toastList; }, toast, lineEpoch,
   }), [theme, themePreference, setTheme, tab, setTab, stack, push, openRootPage, pop, user, loginOpen, logout,
     p, account,
-    setMuted, setMuteOnStartup, setSwipeEp, setPreferHevc, setFsIdleSecs, setVolume, addSearch, clearSearchHist, strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity,
+    setMuted, setMuteOnStartup, setSwipeEp, setPreferHevc, setFsIdleSecs, setStartupTab, setAmbientGlow, setVolume, addSearch, removeSearch, clearSearchHist, strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity,
     toast, lineEpoch, theater, setTheater, fs, setFs, clean, setClean, locked, setLocked]);
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

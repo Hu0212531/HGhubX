@@ -7,9 +7,12 @@ import {
 } from "../../shared/lib/fullscreen";
 import { useFsOrientation } from "../playback/useFsOrientation";
 import type { VideoHandle } from "../playback";
+import type { Toast } from "../../shared/model/store";
+import { resolveFullscreenEpisodeSwipe } from "./fullscreenEpisodeSwipe";
+import { tr } from "../../shared/i18n";
 
 export type PinchState = { d0: number; mx0: number; my0: number; s0: number; x0: number; y0: number };
-export type FeedPanel = "episodes" | "comments" | "article" | "detail" | null;
+export type FeedPanel = "episodes" | "comments" | "article" | "detail" | "more" | null;
 
 type Args = {
   playerRootRef: RefObject<HTMLDivElement | null>;
@@ -36,11 +39,12 @@ type Args = {
   episodesByVideo: Record<number, number>;
   setPanel: Dispatch<SetStateAction<FeedPanel>>;
   onNearEnd?: () => void;
+  toast?: (msg: string, icon?: Toast["icon"], tag?: string) => void;
 };
 
 export function useFeedViewport({
   playerRootRef, boxRef, videoRef, pinchRef, videoIds, effectiveVideoIds, startIndex, mode, kind, active, isItemAllowed,
-  isDesktop, fs, setFs, setClean, paused, wake, swipeEp, epMap, setEpMap, episodesByVideo, setPanel, onNearEnd,
+  isDesktop, fs, setFs, setClean, paused, wake, swipeEp, epMap, setEpMap, episodesByVideo, setPanel, onNearEnd, toast,
 }: Args) {
   const [position, setPosition] = useState(() => ({ id: videoIds[startIndex], index: startIndex }));
   const index = useMemo(() => {
@@ -99,6 +103,10 @@ export function useFeedViewport({
   const idxRef = useRef(index);
   idxRef.current = index;
   const anchoredScroll = useRef<number | null>(null);
+  /* 桌面原生/回退全屏由 fullscreen 跟踪，不经过 store.fs；滚动判定与重锚都要认它，
+     否则全屏改变容器高度后 onScroll 会按旧像素偏移算出别的条目（#180-3）。 */
+  const fullscreenRef = useRef(fullscreen);
+  fullscreenRef.current = fullscreen;
   useLayoutEffect(() => {
     const id = effectiveVideoIds[index];
     if (id !== undefined && (position.id !== id || position.index !== index)) {
@@ -126,7 +134,7 @@ export function useFeedViewport({
 
   /* 滚动定位 */
   const onScroll = useCallback(() => {
-    if (fs || pinchRef.current) return;
+    if (fs || fullscreenRef.current || pinchRef.current) return;
     const el = boxRef.current;
     if (!el) return;
     if (anchoredScroll.current !== null) {
@@ -140,12 +148,12 @@ export function useFeedViewport({
     if (onNearEnd && mode === "home" && i >= effectiveVideoIds.length - 3) onNearEnd();
     window.clearTimeout(swipeTimer.current);
     swipeTimer.current = window.setTimeout(() => resolveSwipe(i), 150);
-  }, [boxRef, pinchRef, effectiveVideoIds.length, onNearEnd, resolveSwipe, fs, mode, renderIndex]);
+  }, [boxRef, pinchRef, effectiveVideoIds.length, onNearEnd, resolveSwipe, fs, fullscreen, mode, renderIndex]);
 
   const go = useCallback((delta: number) => {
     if (!effectiveVideoIds.length) return;
     const next = Math.max(0, Math.min(effectiveVideoIds.length - 1, index + delta));
-    if (fs) {
+    if (fs || fullscreenRef.current) {
       resolveSwipe(next);
       return;
     }
@@ -155,19 +163,73 @@ export function useFeedViewport({
   }, [boxRef, fs, index, effectiveVideoIds.length, resolveSwipe]);
 
   /* 统一的上下切换：swipeEp 开启且为多集视频时优先切集，否则切剧。
-     桌面端键盘 ↑↓ 与右侧按钮都走这里，和移动端上下划手势保持一致。 */
+     桌面端滚轮/触控板、键盘 ↑↓ 与右侧按钮都走这里，和移动端上下划手势保持一致。 */
   const stepDir = useCallback((dir: number) => {
+    if ((fs || fullscreenRef.current) && kind === "video" && curId !== undefined && (swipeEp || totalEpisodes > 1)) {
+      const ep = epMap[curId] || 1;
+      const result = resolveFullscreenEpisodeSwipe(ep, totalEpisodes, dir === 1 ? -1 : 1);
+      if (result && "message" in result) {
+        toast?.(result.message, "info", "episode");
+        return;
+      }
+      if (result) {
+        setEpMap((m) => ({ ...m, [curId]: result.target }));
+        setPanel(null);
+        toast?.(tr("第 {0}集{1}", result.target, totalEpisodes ? ` / ${totalEpisodes}` : ""), "info", "episode");
+        return;
+      }
+    }
     if (swipeEp && kind === "video" && curId !== undefined) {
       const ep = epMap[curId] || 1;
       const want = dir === 1 ? (totalEpisodes > 1 && ep < totalEpisodes ? ep + 1 : 0) : (ep > 1 ? ep - 1 : 0);
       if (want) {
         setEpMap((m) => ({ ...m, [curId]: want }));
         setPanel(null);
+        toast?.(tr("第 {0}集{1}", want, totalEpisodes ? ` / ${totalEpisodes}` : ""), "info", "episode");
         return;
       }
     }
     go(dir);
-  }, [swipeEp, kind, epMap, curId, totalEpisodes, setEpMap, setPanel, go]);
+  }, [fs, swipeEp, kind, epMap, curId, totalEpisodes, setEpMap, setPanel, go, toast]);
+
+  /* 桌面端开启「上下划切集」或处于全屏时，拦截播放区滚轮/触控板纵向滚动并转为 stepDir：
+     桌面端 touch-action:none 不影响 wheel 事件，若不拦截会直接驱动 boxRef 原生纵向切剧。 */
+  const stepDirRef = useRef(stepDir);
+  stepDirRef.current = stepDir;
+  const wheelStateRef = useRef({ acc: 0, lastAt: 0, lockedUntil: 0, lockDir: 0 });
+  useEffect(() => {
+    if (!isDesktop || !active) return undefined;
+    const el = boxRef.current;
+    if (!el) return undefined;
+    const intercept = fullscreen || (swipeEp && kind === "video");
+    if (!intercept) return undefined;
+    const onWheel = (e: WheelEvent) => {
+      if (e.ctrlKey || e.metaKey) return;
+      const dy = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaMode === 2 ? e.deltaY * (el.clientHeight || 600) : e.deltaY;
+      const dx = e.deltaMode === 1 ? e.deltaX * 16 : e.deltaMode === 2 ? e.deltaX * (el.clientWidth || 800) : e.deltaX;
+      if (Math.abs(dy) <= Math.abs(dx)) return;
+      e.preventDefault();
+      window.clearTimeout(swipeTimer.current);
+      const now = Date.now();
+      const s = wheelStateRef.current;
+      const dir = dy > 0 ? 1 : -1;
+      if (now - s.lastAt > 180 || (s.lockDir !== 0 && dir !== s.lockDir)) {
+        s.acc = 0;
+        s.lockedUntil = 0;
+        s.lockDir = 0;
+      }
+      s.lastAt = now;
+      if (now < s.lockedUntil) return;
+      s.acc += dy;
+      if (Math.abs(s.acc) < 36) return;
+      s.acc = 0;
+      s.lockedUntil = now + 260;
+      s.lockDir = dir;
+      stepDirRef.current(dir);
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [boxRef, isDesktop, active, fullscreen, swipeEp, kind]);
 
   const canStep = useCallback((dir: number) => {
     if (swipeEp && kind === "video" && curId !== undefined) {
@@ -235,6 +297,15 @@ export function useFeedViewport({
       if (getFullscreenElement()) void exitDocumentFullscreen().catch(() => {});
       keepAlive();
       return;
+    }
+    /* 进入全屏前固定当前条目并清掉待定的滚动切换，和移动端 enterFs 一致：
+       全屏会改变容器高度，残留的 scrollTop/防抖会把画面切到别的剧（#180-3）。 */
+    window.clearTimeout(swipeTimer.current);
+    const box = boxRef.current;
+    if (box) {
+      const top = idxRef.current * (box.clientHeight || 1);
+      anchoredScroll.current = top;
+      box.scrollTop = top;
     }
     wake();
     keepAlive();
@@ -316,13 +387,13 @@ export function useFeedViewport({
   useEffect(() => {
     const el = boxRef.current;
     if (!el) return undefined;
-    if (fs) {
+    if (fs || fullscreen) {
       el.scrollTop = 0;
       return undefined;
     }
     const syncScroll = () => {
       const box = boxRef.current;
-      if (!box || fs) return;
+      if (!box || fs || fullscreen) return;
       box.scrollTop = index * (box.clientHeight || 1);
     };
     syncScroll();
@@ -334,7 +405,7 @@ export function useFeedViewport({
       window.clearTimeout(t1);
       window.clearTimeout(t2);
     };
-  }, [boxRef, fs, vpLandscape, index]);
+  }, [boxRef, fs, fullscreen, vpLandscape, index]);
 
   useEffect(() => {
     mountedRef.current = true;

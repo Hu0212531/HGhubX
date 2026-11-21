@@ -14,8 +14,9 @@ import { createServer as createViteServer } from "vite";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const scriptScenarios = {
   tv: { script: "test-tv-remote.mjs", timeout: 480000, metrics: { transport: "mock Tauri IPC; actual TV bootstrap, worker, library and player" } },
+  "post-flicker": { script: "test-post-flicker.mjs", timeout: 240000, metrics: { transport: "mock Tauri IPC; real PostDetail/AppProvider/Player; local HLS fixture" } },
 };
-const ALL_SCENARIOS = ["seek", "legacy", "lifecycle", "gesture", "proxy", "portrait-fit", "ios-native", "recovery", "review", "tv"];
+const ALL_SCENARIOS = ["seek", "legacy", "lifecycle", "gesture", "proxy", "portrait-fit", "episode-toast", "ambient", "ios-native", "recovery", "review", "tv", "post-flicker"];
 const { values: args } = parseArgs({ options: {
   "media-dir": { type: "string" }, output: { type: "string" }, "browser-executable": { type: "string" },
   scenarios: { type: "string", default: "seek,legacy,lifecycle,gesture,proxy,portrait-fit" }, help: { type: "boolean" },
@@ -173,6 +174,14 @@ async function gestureChecks(page) {
     }));
   });
   const clean = () => page.locator('.player-root').getAttribute('data-clean');
+  // Regression: after a double-tap pause, a single click on the center play icon resumes playback.
+  await tap(); await tap();
+  await page.waitForFunction(() => document.querySelector("video").paused);
+  const centerPlay = page.getByRole("button", { name: "播放", exact: true });
+  await centerPlay.waitFor();
+  await centerPlay.click();
+  await page.waitForFunction(() => !document.querySelector("video").paused);
+  assert.equal(await clean(), 'false', 'Center play icon must resume playback without another double tap');
   const start = Date.now();
   await tap();
   await page.waitForFunction(() => document.querySelector('.player-root')?.dataset.clean === 'true');
@@ -203,6 +212,22 @@ async function gestureChecks(page) {
     surface.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerId: 92, pointerType: 'touch', button: 0, clientX: bounds.x + 220, clientY: bounds.y + 220 }));
   });
   await page.waitForFunction(() => !document.querySelector('[data-seek-bar]')?.dataset.scrubbing);
+  // 长按只保留临时加速；拖动到顶部胶囊锁定 2x 的旧交互必须消失。
+  const holdBox = await page.locator('[data-mobile-hold-target]').first().boundingBox();
+  assert(holdBox, 'Gesture surface must expose a hold target');
+  const holdPoint = { x: holdBox.x + holdBox.width * .78, y: holdBox.y + holdBox.height * .28 };
+  await page.evaluate(({ x, y }) => {
+    const surface = document.querySelector('[data-mobile-hold-target]');
+    surface.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerId: 94, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1, clientX: x, clientY: y }));
+  }, holdPoint);
+  await page.waitForFunction(() => document.querySelector('video')?.playbackRate > 1.5);
+  assert.equal(await page.getByText(/移入此处锁定|松手即可锁定|已锁定 · 点按解除/).count(), 0,
+    'Speed-lock capsule and its prompts must be removed');
+  await page.evaluate(({ x, y }) => {
+    const surface = document.querySelector('[data-mobile-hold-target]');
+    surface.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerId: 94, pointerType: 'touch', isPrimary: true, button: 0, buttons: 0, clientX: x, clientY: y }));
+  }, holdPoint);
+  await page.waitForFunction(() => document.querySelector('video')?.playbackRate === 1);
   // 2.2.0 反馈回归：切集过渡期（下一集地址未解析）手势 overlay 必须常驻。
   // 修复前第二划落在卸载后的封面/滚动列表上被丢弃或切到别的视频；修复后集数连加且视频不变。
   await page.evaluate(() => window.playerSeekFixture.setLogging(true));
@@ -216,14 +241,22 @@ async function gestureChecks(page) {
     surface.dispatchEvent(new PointerEvent('pointerup', { ...at(y1), buttons: 0 }));
   });
   await swipeUp();
-  await page.getByText('详情 · 第 2 集', { exact: true }).first().waitFor();
+  await page.locator('.mobile-video-episode').filter({ hasText: /^第2集$/ }).first().waitFor();
   await swipeUp();
-  await page.getByText('详情 · 第 3 集', { exact: true }).first().waitFor();
+  await page.locator('.mobile-video-episode').filter({ hasText: /^第3集$/ }).first().waitFor();
   await page.evaluate(() => window.__releasePlay());
   await page.waitForFunction(() => window.playerSeekFixture.logs.some(e => e.event === 'play.resolve' && e.data.video_id === 991 && e.data.episode === 3));
   assert.equal(await page.evaluate(() => window.playerSeekFixture.logs.some(e => e.event === 'play.resolve' && e.data.video_id === 992)), false,
     'Fast episode swipes must stay on the same video');
-  return { singleTapMs, bottomOnlyScrub: true, fastSwipeEpisodes: [2, 3], sameVideo: true };
+  const swipeToggle = page.locator('button.mobile-playback-quick[aria-label*="上下划切集"]').first();
+  for (let i = 0; i < 3; i++) {
+    await swipeToggle.click();
+    await page.waitForTimeout(80);
+  }
+  await page.waitForFunction(() => document.querySelectorAll(".a-toast").length === 1);
+  assert.equal(await page.locator(".a-toast").count(), 1, "Rapid swipe-toggle taps must keep one toast card");
+  assert.match(await page.locator(".a-toast").innerText(), /上下划切集/);
+  return { singleTapMs, bottomOnlyScrub: true, temporaryHoldRestored: 1, fastSwipeEpisodes: [2, 3], sameVideo: true, swipeToggleToastCards: 1 };
 }
 
 // issue #142 回归：手机竖屏视口 + 真实竖屏源（360x640，高>宽）。
@@ -232,7 +265,148 @@ async function gestureChecks(page) {
 //   修复前：landscapeVideo=false 且已测量、非全屏、vpLandscape=false → "cover"（裁切铺满）→ 断言失败；
 //   修复后：竖屏视频一律 "contain"（保留原始比例）→ 断言通过。
 // 第二段用横屏源验证「铺满/适应」切换链路未被修复破坏（该分支修复前后行为一致）。
-async function portraitFitChecks(page) {
+// A landscape fullscreen episode swap resets the measured video size. Until the
+// next source is playing, the stage is not rotated yet; the episode hint must
+// stay hidden instead of flashing at the portrait toast anchor.
+async function episodeToastChecks(page) {
+  await page.addInitScript(() => {
+    const { promise, resolve } = Promise.withResolvers();
+    window.__playGate = promise;
+    window.__releasePlay = resolve;
+    window.__TAURI_INTERNALS__ = { invoke: async () => null };
+  });
+  await page.goto(`${report.ui}/tests/player-seek.html?portrait-fit=1&swipe-ep=1&proxy=${encodeURIComponent(report.media)}`);
+  const dismissGuide = async () => {
+    const done = page.locator(".mobile-hold-guide-done").first();
+    await done.waitFor({ state: "visible", timeout: 5000 }).catch(() => {});
+    await done.click({ timeout: 5000 }).catch(() => {});
+  };
+  const waitForPlayback = () => page.waitForFunction(() => {
+    const v = document.querySelector("video");
+    return v && v.videoWidth === 320 && v.videoHeight === 180 && v.currentTime > .2 && !v.paused;
+  });
+  await dismissGuide();
+  await waitForPlayback();
+  await page.getByRole("button", { name: "全屏", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector(".player-root")?.classList.contains("fs-landscape"));
+  const toast = page.locator(".a-toast").filter({ hasText: /第 2 ?集 \/ 3/ });
+  // The rotated stage maps a rightward screen drag to a swipe-up in video space.
+  await page.evaluate(() => {
+    const surface = document.querySelector("[data-mobile-hold-target]");
+    const box = surface.getBoundingClientRect();
+    const y = box.y + box.height / 2;
+    const x0 = box.x + box.width * .3, x1 = box.x + box.width * .7;
+    surface.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerId: 121, pointerType: "touch", isPrimary: true, button: 0, buttons: 1, clientX: x0, clientY: y }));
+    surface.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, pointerId: 121, pointerType: "touch", isPrimary: true, button: 0, buttons: 1, clientX: x1, clientY: y }));
+    surface.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerId: 121, pointerType: "touch", isPrimary: true, button: 0, buttons: 0, clientX: x1, clientY: y }));
+  });
+  await page.waitForTimeout(350);
+  assert.equal(await toast.count(), 0, "Episode hint must wait while the next video is still loading");
+  await page.evaluate(() => window.__releasePlay());
+  await waitForPlayback();
+  await page.waitForFunction(() => document.querySelector(".player-root")?.classList.contains("fs-landscape"));
+  await toast.waitFor();
+  assert.equal(await toast.count(), 1, "Episode hint must appear once the next video starts playing");
+  assert(await toast.evaluate(el => !!el.closest(".player-root.fs-landscape")), "Episode hint must land in the rotated landscape stage");
+  return { deferredWhileLoading: true, host: "rotated-stage", text: (await toast.innerText()).trim() };
+}
+
+// Ambient glow is a sampled color wash behind the video. It must follow the
+// live setting, render on a readable source, and leave no layer when disabled.
+async function ambientGlowChecks(page) {
+  await page.addInitScript(() => {
+    window.__TAURI_INTERNALS__ = { invoke: async () => null };
+  });
+  const open = () => page.goto(`${report.ui}/tests/player-seek.html?diagnostics=1&portrait-fit=1&proxy=${encodeURIComponent(report.portraitMedia)}`);
+  const dismissGuide = async () => {
+    const done = page.locator(".mobile-hold-guide-done").first();
+    await done.waitFor({ state: "visible", timeout: 5000 }).catch(() => {});
+    await done.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForFunction(() => !document.querySelector(".mobile-hold-guide-done"), null, { timeout: 5000 }).catch(() => {});
+  };
+  const waitForPlayback = () => page.waitForFunction(() => {
+    const v = document.querySelector("video");
+    return v && v.videoWidth === 360 && v.videoHeight === 640 && v.currentTime > 1 && !v.paused;
+  });
+  const openSettingsPage = async () => {
+    await page.getByRole("button", { name: "诊断设置", exact: true }).click();
+    const settings = page.locator(".ios-settings-page");
+    await settings.waitFor({ state: "visible" });
+    await settings.getByRole("button", { name: "播放设置", exact: true }).click();
+    await page.waitForFunction(() => {
+      const panel = document.querySelector("#settings-播放");
+      return panel && !panel.querySelector("[hidden]");
+    });
+    return settings;
+  };
+  const closeSettingsPage = async (settings) => {
+    await settings.getByRole("button", { name: "返回", exact: true }).click();
+    await settings.waitFor({ state: "hidden" });
+  };
+  const persistedAmbient = () => page.evaluate(() => JSON.parse(localStorage.getItem("hghubx_app_v1") || "{}").ambientGlow);
+
+  await open();
+  await dismissGuide();
+  await waitForPlayback();
+  await page.waitForFunction(() => Number(document.querySelector(".hg-ambient-glow-canvas")?.dataset.frames || 0) > 0);
+  const on = await page.evaluate(() => ({
+    layers: document.querySelectorAll(".hg-ambient-glow").length,
+    frames: Number(document.querySelector(".hg-ambient-glow-canvas")?.dataset.frames || 0),
+    canvas: !!document.querySelector(".hg-ambient-glow-canvas"),
+  }));
+  assert.equal(on.layers, 1, "Ambient glow must render by default");
+  assert.equal(on.canvas, true, "Ambient glow needs a sample canvas");
+  assert(on.frames > 0, "Ambient glow must sample the playing video");
+
+  const settings = await openSettingsPage();
+  const glow = settings.getByRole("switch", { name: "微光效果", exact: true });
+  const hevc = settings.getByRole("switch", { name: "优先高清", exact: true });
+  const [glowBox, hevcBox] = await Promise.all([glow.boundingBox(), hevc.boundingBox()]);
+  assert(glowBox && hevcBox, "Both playback toggles must occupy a real box");
+  assert(Math.abs(glowBox.x - hevcBox.x) <= 1, "Ambient glow toggle must right-align with the priority-HD toggle");
+  assert(Math.abs(glowBox.width - hevcBox.width) <= 1 && Math.abs(glowBox.height - hevcBox.height) <= 1,
+    "Ambient glow toggle must match the priority-HD toggle size");
+  assert.equal(await glow.getAttribute("aria-checked"), "true", "Settings page must reflect the persisted ambient glow setting");
+  await glow.click();
+  await page.waitForFunction(() => document.querySelectorAll(".hg-ambient-glow").length === 0);
+  assert.equal(await glow.getAttribute("aria-checked"), "false", "Settings page switch must disable ambient glow");
+  await page.waitForFunction(() => JSON.parse(localStorage.getItem("hghubx_app_v1") || "{}").ambientGlow === false);
+  await closeSettingsPage(settings);
+
+  await page.getByRole("button", { name: "更多播放设置", exact: true }).click();
+  const more = page.getByRole("dialog", { name: "播放设置", exact: true });
+  await more.waitFor({ state: "visible" });
+  assert.equal(await more.getByRole("switch", { name: "微光效果", exact: true }).count(), 0,
+    "Ambient glow must not appear in the More playback panel");
+  await more.getByRole("button", { name: "关闭播放设置", exact: true }).click();
+  await more.waitFor({ state: "hidden" });
+
+  await page.reload();
+  await dismissGuide();
+  await waitForPlayback();
+  const off = await page.evaluate(() => ({
+    layers: document.querySelectorAll(".hg-ambient-glow").length,
+    persisted: JSON.parse(localStorage.getItem("hghubx_app_v1") || "{}").ambientGlow,
+  }));
+  assert.equal(off.layers, 0, "Disabling ambient glow must remove the layer");
+  assert.equal(off.persisted, false, "Ambient glow preference must persist");
+
+  const settingsAfterReload = await openSettingsPage();
+  const glowAfterReload = settingsAfterReload.getByRole("switch", { name: "微光效果", exact: true });
+  assert.equal(await glowAfterReload.getAttribute("aria-checked"), "false", "Settings page must restore the disabled state");
+  await glowAfterReload.click();
+  await page.waitForFunction(() => document.querySelectorAll(".hg-ambient-glow").length === 1);
+  assert.equal(await persistedAmbient(), true, "Settings page switch must persist re-enabling");
+  return { defaultOn: true, sampledFrames: on.frames, offLayers: off.layers, settingsToggle: true, morePanelToggle: false };
+}
+
+async function portraitFitChecks(page, dir) {
+  // The mobile fullscreen transition asks Tauri to lock the screen orientation.
+  // This scenario runs in Chromium, so provide only that bridge and keep the
+  // rest of the playback stack real.
+  await page.addInitScript(() => {
+    window.__TAURI_INTERNALS__ = { invoke: async () => null };
+  });
   const open = proxy => page.goto(`${report.ui}/tests/player-seek.html?diagnostics=1&portrait-fit=1&proxy=${encodeURIComponent(proxy)}`);
   // onSize 是原生媒体事件里的 React 更新；双 rAF 保证 setVsize 已提交到 DOM（帧同步，非任意 sleep）。
   const afterCommit = () => page.evaluate(() => new Promise(done => requestAnimationFrame(() => requestAnimationFrame(() => done(undefined)))));
@@ -264,12 +438,83 @@ async function portraitFitChecks(page) {
   });
   await afterCommit();
   assert.equal(await objectFit(), "contain", "Landscape video in a portrait viewport must default to contain");
+  assert.equal(await page.getByRole("button", { name: "铺满", exact: true }).count(), 0, "Floating fill control must be removed");
+  assert.equal(await page.getByRole("button", { name: "横屏", exact: true }).count(), 0, "Floating rotate control must be removed");
+  await page.getByRole("button", { name: "更多播放设置" }).click();
+  await page.getByRole("dialog", { name: "播放设置" }).waitFor();
   await page.getByRole("button", { name: "铺满", exact: true }).click();
   await page.waitForFunction(() => getComputedStyle(document.querySelector("video")).objectFit === "cover");
   await page.getByRole("button", { name: "适应", exact: true }).click();
   await page.waitForFunction(() => getComputedStyle(document.querySelector("video")).objectFit === "contain");
+  // PR #177 removes the floating fill/rotate controls, so this regression must
+  // enter fullscreen through the persistent bottom-dock control. Close its
+  // settings sheet first so the same case also runs after that PR lands.
+  const settingsDialog = page.getByRole("dialog", { name: "播放设置", exact: true });
+  if (await settingsDialog.count()) {
+    await settingsDialog.getByRole("button", { name: "关闭播放设置", exact: true }).click();
+    await settingsDialog.waitFor({ state: "hidden" });
+  }
+
+  // Rotated landscape fullscreen: the clean-mode lock and the shutdown unlock
+  // must occupy the same stage-local anchor even when the phone has a bottom
+  // safe-area inset. The rotated stage maps --sab to its right edge.
+  await page.locator(".player-root").evaluate(el => {
+    el.style.setProperty("--sab", "34px");
+    el.style.setProperty("--sar", "0px");
+    el.style.setProperty("--sal", "0px");
+    el.style.setProperty("--sat", "44px");
+  });
+  await page.getByRole("button", { name: "全屏", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector(".player-root")?.classList.contains("fs-landscape"));
+  await page.waitForTimeout(250);
+  const qualityBox = await page.locator(".feed-current-quality").boundingBox();
+  assert(qualityBox, "Quality indicator must be visible before clean mode");
+  await page.evaluate(() => {
+    const surface = document.querySelector("[data-mobile-hold-target]");
+    const box = surface.getBoundingClientRect();
+    for (const type of ["pointerdown", "pointerup"]) surface.dispatchEvent(new PointerEvent(type, {
+      bubbles: true, pointerId: 93, pointerType: "touch", button: 0,
+      clientX: box.x + box.width / 2, clientY: box.y + box.height / 2,
+    }));
+  });
+  await page.waitForFunction(() => document.querySelector(".player-root")?.dataset.clean === "true");
+  const cleanLock = page.getByRole("button", { name: "锁定屏幕", exact: true });
+  await cleanLock.waitFor();
+  const cleanBox = await cleanLock.boundingBox();
+  await cleanLock.click();
+  const unlock = page.getByRole("button", { name: "解锁屏幕", exact: true });
+  await page.getByText("已锁定屏幕", { exact: true }).waitFor();
+  assert.equal(await page.locator(".mobile-clean-lock").count(), 0, "Locking must hide the clean lock icon");
+  assert.equal(await unlock.count(), 0, "Unlock control must stay hidden until the first tap");
+  assert.equal(await page.locator(".a-toast").count(), 1, "Locking must show exactly one status toast");
+  await page.screenshot({ path: join(dir, "lock-hidden.png") });
+  // Rapid taps on the shield only refresh the same screen-lock toast; they must not stack cards.
+  for (let i = 0; i < 5; i += 1) await page.mouse.click(40, 120);
+  await unlock.waitFor();
+  await page.getByText("轻触即可解锁", { exact: true }).waitFor();
+  assert.equal(await page.locator(".a-toast").count(), 1, "Repeated locked-area taps must keep one toast");
+  await page.screenshot({ path: join(dir, "unlock-revealed.png") });
+  await page.waitForTimeout(2300);
+  assert.equal(await unlock.count(), 0, "Unlock control must hide with the screen-lock hint");
+  assert.equal(await page.locator(".a-toast").count(), 0, "Screen-lock hint must expire with the unlock control");
+  await page.mouse.click(40, 120);
+  await unlock.waitFor();
+  const unlockBox = await unlock.boundingBox();
+  assert(cleanBox && unlockBox, "Both the clean lock and unlock controls must be measurable");
+  const anchorDelta = Math.hypot(cleanBox.x - unlockBox.x, cleanBox.y - unlockBox.y);
+  assert(anchorDelta < 1, `Clean lock must keep the unlock anchor in rotated fullscreen (delta ${anchorDelta.toFixed(1)}px)`);
+  const center = box => ({ x: box.x + box.width / 2, y: box.y + box.height / 2 });
+  const cleanCenter = center(cleanBox), qualityCenter = center(qualityBox);
+  // After the 90-degree stage rotation, stage Y is the upright X axis.
+  const qualityAlignDelta = Math.abs(cleanCenter.y - qualityCenter.y);
+  assert(qualityAlignDelta < 1, `Lock and quality indicator must share the upright right edge (delta ${qualityAlignDelta.toFixed(1)}px)`);
+  await unlock.click();
+  await page.getByText("已解锁", { exact: true }).waitFor();
+  await unlock.waitFor({ state: "hidden" });
+  assert.equal(await page.locator(".a-toast").count(), 1, "Unlocking must replace the hint instead of stacking");
+  assert.equal(await page.getByRole("button", { name: "锁定屏幕", exact: true }).count(), 0, "Unlock exits clean mode and hides the lock icon");
   return { viewport: "390x844", portrait_source: "360x640", portrait_object_fit: portrait.objectFit,
-    landscape_default_fit: "contain", landscape_toggle: ["contain", "cover", "contain"] };
+    landscape_default_fit: "contain", landscape_toggle: ["contain", "cover", "contain"], floating_fit_rotate: 0 };
 }
 
 async function seekChecks(page, legacy) {
@@ -359,8 +604,33 @@ async function seekChecks(page, legacy) {
   assert(rejected, "Failed persistence must reject");
   await clickProgress(page, .3);
   assert.equal((await getLogs(page)).length, count, "Failed persistence must keep logging disabled");
+  if (!legacy) {
+    // Desktop swipeEp regression: wheel scrolling over the feed player must switch episodes
+    // when swipeEp is enabled instead of scrolling boxRef to the next drama, and bottom-bar
+    // Next must follow swipeEp when toggled off.
+    await loadPlayer(page, false, "&swipe-ep=1");
+    const activeMeta = page.locator("section:not([inert]) .desktop-video-meta");
+    const epBadge = activeMeta.getByText(/^第 \d+\/3 集$/);
+    await epBadge.waitFor();
+    assert.equal(await epBadge.innerText(), "第 1/3 集");
+    const swipeBtn = page.getByRole("button", { name: "上下划切集", exact: true });
+    assert.equal(await swipeBtn.getAttribute("aria-pressed"), "true");
+    const rootBox = await page.locator(".player-root").boundingBox();
+    await page.mouse.move(rootBox.x + rootBox.width / 2, rootBox.y + rootBox.height / 2);
+    await page.mouse.wheel(0, 120);
+    await page.waitForFunction(() => document.querySelector("section:not([inert]) .desktop-video-meta")?.textContent?.includes("第 2/3 集"));
+    assert.equal(await activeMeta.locator("p").first().innerText(), "Seek fixture");
+    await page.getByText("第 2集 / 3", { exact: true }).waitFor();
+    await page.waitForTimeout(300);
+    await page.mouse.wheel(0, -120);
+    await page.waitForFunction(() => document.querySelector("section:not([inert]) .desktop-video-meta")?.textContent?.includes("第 1/3 集"));
+    await swipeBtn.click();
+    await page.getByText("上下划切集已关闭", { exact: true }).waitFor();
+    await page.getByRole("button", { name: "下一部 ↓", exact: true }).click();
+    await page.waitForFunction(() => document.querySelector("section:not([inert]) .desktop-video-meta")?.textContent?.includes("Other fixture"));
+  }
   return { click_ms: logs.find(e => e.event === "seek.resumed" && e.data.seek === first.data.seek)?.data.elapsed_ms, drag_requests: drags.length,
-    ...(!legacy ? { speed_menu_keyboard: { playing_preserved: true, paused_preserved: true, activation: ["Space", "Enter"], navigation: ["ArrowUp", "ArrowDown", "Home", "End"], exit: ["Escape", "Tab"], focus_restored: true } } : {}) };
+    ...(!legacy ? { desktop_swipe_ep_wheel: true, speed_menu_keyboard: { playing_preserved: true, paused_preserved: true, activation: ["Space", "Enter"], navigation: ["ArrowUp", "ArrowDown", "Home", "End"], exit: ["Escape", "Tab"], focus_restored: true } } : {}) };
 }
 async function lifecyclePlayerCheck(page, legacy) {
   let release, held, holdDeadline;
@@ -591,7 +861,7 @@ async function explicitRecoveryCheck(page) {
 }
 
 try {
-  if (scenarios.some(name => name !== "ios-native" && name !== "tv" && name !== "review")) {
+  if (scenarios.some(name => name !== "ios-native" && name !== "tv" && name !== "review" && name !== "post-flicker")) {
     let mediaDir = args["media-dir"] && resolve(args["media-dir"]);
     if (!mediaDir) {
       temporaryMedia = await mkdtemp(join(tmpdir(), "hghubx-playback-")); mediaDir = temporaryMedia;
@@ -600,7 +870,7 @@ try {
     vite = await createViteServer({ root, server: { host: "127.0.0.1", port: 0, strictPort: false, hmr: false, open: false } });
     await vite.listen(); report.ui = `http://127.0.0.1:${vite.httpServer.address().port}`;
     media = await serveMedia(mediaDir); report.media = `http://127.0.0.1:${media.address().port}`;
-    if (scenarios.includes("portrait-fit")) {
+    if (scenarios.includes("portrait-fit") || scenarios.includes("ambient")) {
       temporaryPortraitMedia = await mkdtemp(join(tmpdir(), "hghubx-playback-portrait-"));
       try { generateHlsFixture(temporaryPortraitMedia, "360x640"); } catch { throw new Error("Cannot generate portrait HLS fixture: install FFmpeg (libx264/AAC) or set FFMPEG_PATH"); }
       portraitMedia = await serveMedia(temporaryPortraitMedia); report.portraitMedia = `http://127.0.0.1:${portraitMedia.address().port}`;
@@ -610,16 +880,16 @@ try {
   }
   for (const name of scenarios) {
     const dir = join(output, name); await mkdir(dir);
-    if (name === "tv") {
+    if (scriptScenarios[name]) {
       const result = { name, status: "running", started: new Date().toISOString() }; report.cases.push(result);
       let stdout = "", stderr = "";
       try {
-        const child = await promisify(execFile)(process.execPath, [join(root, "scripts", scriptScenarios.tv.script)], {
-          cwd: root, encoding: "utf8", timeout: scriptScenarios.tv.timeout, maxBuffer: 8 * 1024 * 1024,
+        const child = await promisify(execFile)(process.execPath, [join(root, "scripts", scriptScenarios[name].script)], {
+          cwd: root, encoding: "utf8", timeout: scriptScenarios[name].timeout, maxBuffer: 8 * 1024 * 1024,
           env: { ...process.env, ...(args["browser-executable"] ? { BROWSER_EXECUTABLE: args["browser-executable"] } : {}) },
         });
         stdout = child.stdout; stderr = child.stderr;
-        result.metrics = { exit_code: 0, ...scriptScenarios.tv.metrics };
+        result.metrics = { exit_code: 0, ...scriptScenarios[name].metrics };
         result.status = "passed"; console.log(`PASS ${name}: ${JSON.stringify(result.metrics)}`);
       } catch (error) {
         stdout = error.stdout || ""; stderr = error.stderr || "";
@@ -691,8 +961,8 @@ try {
       }
       continue;
     }
-    const mobileContext = name === "gesture" || name === "portrait-fit";
-    const context = await browser.newContext({ ...(mobileContext ? {userAgent:"Mozilla/5.0 (iPhone; CPU iPhone OS 17_1_1 like Mac OS X) AppleWebKit/605.1.15 Version/17.1 Mobile/15E148 Safari/604.1",hasTouch:true} : {}), viewport: name === "portrait-fit" ? { width: 390, height: 844 } : { width: 1000, height: 900 } });
+    const mobileContext = name === "gesture" || name === "portrait-fit" || name === "episode-toast" || name === "ambient";
+    const context = await browser.newContext({ ...(mobileContext ? {userAgent:"Mozilla/5.0 (iPhone; CPU iPhone OS 17_1_1 like Mac OS X) AppleWebKit/605.1.15 Version/17.1 Mobile/15E148 Safari/604.1",hasTouch:true} : {}), viewport: name === "portrait-fit" || name === "episode-toast" || name === "ambient" ? { width: 390, height: 844 } : { width: 1000, height: 900 } });
     await context.exposeBinding("collectPlaybackLogs", (_source, entries) => {
       for (const e of entries) jsonl(join(dir, "playback.jsonl"), { ts: e.data.at, event: `web.${e.event}`, data: e.data, transport: "browser-fixture" });
     });
@@ -715,7 +985,7 @@ try {
     const result = { name, status: "running", started: new Date().toISOString() }; report.cases.push(result);
     let deadline;
     try {
-      const action = name === "recovery" ? explicitRecoveryCheck(page) : name === "proxy" ? proxyRecoveryCheck(page) : name === "gesture" ? gestureChecks(page) : name === "portrait-fit" ? portraitFitChecks(page) : name === "seek" || name === "legacy" ? seekChecks(page, name === "legacy") : lifecycleCheck(page);
+      const action = name === "recovery" ? explicitRecoveryCheck(page) : name === "proxy" ? proxyRecoveryCheck(page) : name === "gesture" ? gestureChecks(page) : name === "portrait-fit" ? portraitFitChecks(page, dir) : name === "episode-toast" ? episodeToastChecks(page) : name === "ambient" ? ambientGlowChecks(page) : name === "seek" || name === "legacy" ? seekChecks(page, name === "legacy") : lifecycleCheck(page);
       result.metrics = await Promise.race([action, new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error("Scenario exceeded 45 seconds")), 45000); })]);
       assert.deepEqual(pageErrors, [], "Browser script errors");
       assert.deepEqual(externalRequests, [], "Unexpected external network requests");
